@@ -443,6 +443,7 @@ struct ContentView: View {
     @AppStorage("iliad.showSidebar") private var showSidebar = true
     @AppStorage("iliad.focus") private var focus = true
     @AppStorage("iliad.typewriter") private var typewriter = false
+    @AppStorage("iliad.spellcheck") private var spellcheck = true
     @AppStorage("iliad.showStats") private var showStats = true
     @AppStorage("iliad.zen") private var zen = false
     @AppStorage("iliad.showTerminal") private var showTerminal = false
@@ -587,6 +588,7 @@ struct ContentView: View {
                 }
                 // Theme & appearance
                 bubble {
+                    toolBtn("textformat.characters.dottedunderline", spellcheck, "Spell check") { spellcheck.toggle() }
                     toolBtn(theme.dark ? "sun.max" : "moon", false, "Toggle light / dark (⌘D)") { theme.toggle() }
                     themeMenu
                 }
@@ -740,7 +742,7 @@ struct ContentView: View {
                                    token: store.loadToken, pal: pal,
                                    themeID: theme.currentName + "|" + theme.fontName + "|" + String(zoom) + "|" + String(fontSize) + "|" + String(lineHeight) + "|" + String(theme.bodyWeight) + "|" + String(theme.headingWeight),
                                    zoom: CGFloat(zoom), baseSize: CGFloat(fontSize), lineHeight: CGFloat(lineHeight), measure: CGFloat(measure),
-                                   focusMode: focus, typewriter: typewriter,
+                                   focusMode: focus, typewriter: typewriter, spellcheck: spellcheck,
                                    review: store.review,
                                    onChange: { store.edited($0) },
                                    onResolve: { id, decision in store.resolve([id: decision]) },

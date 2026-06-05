@@ -226,6 +226,7 @@ struct EditorView: NSViewRepresentable {
     let measure: CGFloat
     let focusMode: Bool
     let typewriter: Bool
+    let spellcheck: Bool
     let review: Review?
     let onChange: (String) -> Void
     let onResolve: (Int, String) -> Void
@@ -233,6 +234,25 @@ struct EditorView: NSViewRepresentable {
 
     func diffKey(_ r: Review) -> String {
         r.path + "|" + r.blocks.map { "\($0.id)\($0.changed ? "c" : "e")\($0.oldText.count)-\($0.newText.count)" }.joined(separator: ",")
+    }
+
+    // Mark every misspelled word's underline now (synchronous, no selection change), instead of
+    // waiting on the continuous checker's lazy pass.
+    private func remarkSpelling(_ tv: NSTextView) {
+        guard let lm = tv.layoutManager else { return }
+        let str = tv.string
+        let len = (str as NSString).length
+        lm.removeTemporaryAttribute(.spellingState, forCharacterRange: NSRange(location: 0, length: len))
+        let checker = NSSpellChecker.shared
+        var start = 0
+        while start < len {
+            let r = checker.checkSpelling(of: str, startingAt: start, language: nil, wrap: false,
+                                          inSpellDocumentWithTag: 0, wordCount: nil)
+            guard r.location != NSNotFound, r.length > 0 else { break }
+            lm.addTemporaryAttribute(.spellingState, value: NSAttributedString.SpellingState.spelling.rawValue,
+                                     forCharacterRange: r)
+            start = r.location + r.length
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -262,7 +282,7 @@ struct EditorView: NSViewRepresentable {
         tv.isAutomaticDashSubstitutionEnabled = false        // never em-dash
         tv.isAutomaticTextReplacementEnabled = false
         tv.isAutomaticSpellingCorrectionEnabled = false
-        tv.isContinuousSpellCheckingEnabled = true
+        tv.isContinuousSpellCheckingEnabled = spellcheck
         tv.isVerticallyResizable = true
         tv.isHorizontallyResizable = false
         tv.minSize = NSSize(width: 0, height: 0)
@@ -286,6 +306,15 @@ struct EditorView: NSViewRepresentable {
         let c = context.coordinator
         c.parent = self
         applyTheme(tv, scroll)
+
+        if tv.isContinuousSpellCheckingEnabled != spellcheck {
+            tv.isContinuousSpellCheckingEnabled = spellcheck
+            if spellcheck { remarkSpelling(tv) }               // show squiggles immediately, no cursor move
+            else {                                             // hide existing red underlines
+                let len = (tv.string as NSString).length
+                tv.layoutManager?.removeTemporaryAttribute(.spellingState, forCharacterRange: NSRange(location: 0, length: len))
+            }
+        }
 
         // Diff mode: render changes inline in the SAME text view (scroll + styling preserved).
         if let review = review {
