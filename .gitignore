@@ -1,0 +1,14 @@
+# SwiftPM build output
+.build/
+
+# Built app bundle and icon staging (produced by build.sh)
+Iliad.app/
+*.iconset/
+
+# Xcode / SwiftPM user state
+.swiftpm/
+*.xcuserstate
+xcuserdata/
+
+# macOS
+.DS_Store
