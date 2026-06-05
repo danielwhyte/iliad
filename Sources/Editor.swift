@@ -112,24 +112,74 @@ struct DiffPill: View {
     }
 }
 
+// Clip view that always keeps an integral (whole-pixel) width. A non-integral clip width breaks
+// the "same width" contract with the text view and makes it creep/jump every time the scroll view
+// resizes through fractional widths, which is exactly what the sidebar push animation does.
+final class IntegralClipView: NSClipView {
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(NSSize(width: floor(newSize.width), height: newSize.height))
+    }
+    override var frame: NSRect {
+        get { super.frame }
+        set { var f = newValue; f.size.width = floor(f.size.width); super.frame = f }
+    }
+}
+
+// Scroll view that can ignore AppKit's *programmatic* re-scroll (the "centered scroll to visible"
+// that fires when the text inset changes during a resize). User trackpad/scroller scrolling goes
+// through a different path and is unaffected, so suppressing this only kills the resize jolt.
+final class StableScrollView: NSScrollView {
+    var suppressAutoScroll = false
+    override func scroll(_ clipView: NSClipView, to point: NSPoint) {
+        if suppressAutoScroll { return }
+        super.scroll(clipView, to: point)
+    }
+}
+
 // A text view that keeps a fixed-width reading column, flexing the side padding
 // down to a minimum, then letting the column go fluid (relative to the window).
 final class ColumnTextView: NSTextView {
     var columnMeasure: CGFloat = 680
     var minPad: CGFloat = 24
     var topInset: CGFloat = 60
+    private var unsuppressWork: DispatchWorkItem?
+
+    // Block AppKit's auto re-scroll for a short burst around any width change (covers the whole
+    // resize/animation and the settle just after the mouse is released), then re-enable it.
+    private func holdScroll() {
+        guard let sv = enclosingScrollView as? StableScrollView else { return }
+        sv.suppressAutoScroll = true
+        unsuppressWork?.cancel()
+        let w = DispatchWorkItem { [weak sv] in sv?.suppressAutoScroll = false }
+        unsuppressWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: w)
+    }
+
+    override func viewWillStartLiveResize() {
+        super.viewWillStartLiveResize()
+        holdScroll()
+    }
+    override func viewDidEndLiveResize() {
+        holdScroll()   // keep blocking through AppKit's end-of-resize "centered scroll"
+        super.viewDidEndLiveResize()
+    }
 
     override func layout() {
-        let w = enclosingScrollView?.contentSize.width ?? bounds.width
-        let side = max(minPad, (w - columnMeasure) / 2)   // padding flexes; below min, column shrinks
-        guard abs(textContainerInset.width - side) > 0.5 || textContainerInset.height != topInset else {
-            super.layout(); return
-        }
-        // Only the side padding changes when the column isn't reflowing; pin the vertical scroll
-        // so a sidebar push doesn't jolt the page.
+        let viewW = enclosingScrollView?.contentSize.width ?? bounds.width
+        // The column is a FIXED width (rounded), centered by the inset. Wrapping depends only on the
+        // container width, so holding it constant means words never re-wrap while the window stays wide;
+        // it only shrinks once the window is too narrow to fit the full measure plus the minimum padding.
+        let colW = min(columnMeasure, max(120, viewW - minPad * 2)).rounded()
+        let side = max(0, (viewW - colW) / 2).rounded()
+        let tc = textContainer
+        let widthChanged = tc != nil && abs(tc!.size.width - colW) > 0.5
+        let insetChanged = abs(textContainerInset.width - side) > 0.5 || textContainerInset.height != topInset
+        guard widthChanged || insetChanged else { super.layout(); return }
+        holdScroll()   // suppress the inset-change re-scroll for this resize burst
         let clip = enclosingScrollView?.contentView
         let savedY = clip?.bounds.origin.y ?? 0
-        textContainerInset = NSSize(width: side, height: topInset)
+        if let tc = tc, widthChanged { tc.size = NSSize(width: colW, height: tc.size.height) }
+        if insetChanged { textContainerInset = NSSize(width: side, height: topInset) }
         super.layout()
         if let clip = clip, abs(clip.bounds.origin.y - savedY) > 0.5 {
             clip.setBoundsOrigin(NSPoint(x: clip.bounds.origin.x, y: savedY))
@@ -188,7 +238,8 @@ struct EditorView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSScrollView()
+        let scroll = StableScrollView()
+        scroll.contentView = IntegralClipView()   // whole-pixel width -> no creep/jump on resize
         scroll.drawsBackground = true
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = false
@@ -196,8 +247,8 @@ struct EditorView: NSViewRepresentable {
         scroll.borderType = .noBorder
         scroll.autoresizingMask = [.width, .height]
 
-        let container = NSTextContainer(containerSize: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
-        container.widthTracksTextView = true   // column width = view width - insets (responsive)
+        let container = NSTextContainer(containerSize: NSSize(width: measure, height: CGFloat.greatestFiniteMagnitude))
+        container.widthTracksTextView = false   // we pin an exact column width in layout() so words don't re-wrap on resize
         container.lineFragmentPadding = 0
         let lm = NSLayoutManager(); lm.addTextContainer(container)
         let ts = NSTextStorage(); ts.addLayoutManager(lm)
