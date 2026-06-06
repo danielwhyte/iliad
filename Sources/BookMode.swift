@@ -38,6 +38,7 @@ struct BookStyle: Equatable {
     var justified: Bool = true
     var hyphenate: Bool = true
     var indentParagraphs: Bool = true
+    var showGuides: Bool = true            // margin guides (preview only; not printed)
     var bodyFont: String = "Literata"      // book fonts are independent of the editor's font
     var headingFont: String = "Literata"
     var headingSizes: [CGFloat] = [24, 19, 16, 14, 13, 12]   // h1…h6, points
@@ -446,6 +447,7 @@ extension BookStyle {
         justified: \(justified)
         hyphenate: \(hyphenate)
         indentParagraphs: \(indentParagraphs)
+        showGuides: \(showGuides)
         headingSizes: \(headingSizes.map { trim($0) }.joined(separator: ","))
         tableBorder: \(trim(tableBorder))
         tablePadding: \(trim(tablePadding))
@@ -474,6 +476,7 @@ extension BookStyle {
             case "justified": justified = (v == "true")
             case "hyphenate": hyphenate = (v == "true")
             case "indentParagraphs": indentParagraphs = (v == "true")
+            case "showGuides": showGuides = (v == "true")
             case "headingSizes":
                 let nums = v.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)).map { CGFloat($0) } }
                 if nums.count == 6 { headingSizes = nums }
@@ -518,12 +521,11 @@ struct BookModeView: View {
     @State private var style = BookStyle()
     @State private var zoom: CGFloat = 1.0
     @State private var tab = 0
-    @AppStorage("iliad.book.showGuides") private var showGuides = true
 
     var body: some View {
         HStack(spacing: 0) {
             ZStack(alignment: .bottomLeading) {
-                BookCanvas(markdown: markdown, style: style, pal: pal, zoom: zoom, showGuides: showGuides)
+                BookCanvas(markdown: markdown, style: style, pal: pal, zoom: zoom, showGuides: style.showGuides)
                 zoomControl.padding(.leading, 14).padding(.bottom, 12)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -604,7 +606,7 @@ struct BookModeView: View {
                     }.labelsHidden().frame(width: 130)
                 }
                 Toggle("Facing pages", isOn: $style.facing).controlSize(.small)
-                Toggle("Show margins", isOn: $showGuides).controlSize(.small)
+                Toggle("Show margins", isOn: $style.showGuides).controlSize(.small)
             }
             section("MARGINS") {
                 slider("Top", dbl(\.marginTop), 0...40, unit: "mm")
