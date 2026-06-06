@@ -437,12 +437,22 @@ struct EditorView: NSViewRepresentable {
         private var navIndex = -1
         private var navObserver: NSObjectProtocol?
         private var frameObserver: NSObjectProtocol?
+        private var gotoObserver: NSObjectProtocol?
         private var diffPills: [NSView] = []
 
         func startDiffNavObserver() {
             if navObserver == nil {
                 navObserver = NotificationCenter.default.addObserver(forName: .iliadDiffNav, object: nil, queue: .main) { [weak self] note in
                     self?.scrollToChange((note.object as? String) == "prev" ? -1 : 1)
+                }
+            }
+            if gotoObserver == nil {   // outline navigation: scroll the editor to a character offset
+                gotoObserver = NotificationCenter.default.addObserver(forName: .iliadGoto, object: nil, queue: .main) { [weak self] note in
+                    guard let self, let tv = self.textView, let off = note.object as? Int, !self.inDiff else { return }
+                    let loc = min(max(0, off), (tv.string as NSString).length)
+                    tv.setSelectedRange(NSRange(location: loc, length: 0))
+                    tv.scrollRangeToVisible(NSRange(location: loc, length: 0))
+                    tv.window?.makeFirstResponder(tv)
                 }
             }
             if frameObserver == nil, let tv = textView {
@@ -456,6 +466,7 @@ struct EditorView: NSViewRepresentable {
         deinit {
             if let o = navObserver { NotificationCenter.default.removeObserver(o) }
             if let o = frameObserver { NotificationCenter.default.removeObserver(o) }
+            if let o = gotoObserver { NotificationCenter.default.removeObserver(o) }
         }
 
         func removeDiffPills() { diffPills.forEach { $0.removeFromSuperview() }; diffPills = [] }

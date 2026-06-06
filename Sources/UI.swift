@@ -76,6 +76,30 @@ func buildTree(folders: [String], files: [DocMeta]) -> TNode {
 }
 
 // ----------  Sidebar  ----------
+// Xcode-style icon segmented control (navigator / inspector selector): a row of icon buttons,
+// the selected one filled with the accent. Used at the top of the left panel and the book inspector.
+struct IconTabs: View {
+    @Binding var selection: Int
+    let tabs: [(icon: String, help: String)]
+    let pal: Pal
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(tabs.indices, id: \.self) { i in
+                Button(action: { selection = i; DispatchQueue.main.async { NSCursor.arrow.set() } }) {
+                    Image(systemName: tabs[i].icon)
+                        .font(.system(size: 13, weight: .medium))
+                        .frame(width: 30, height: 22)
+                        .foregroundColor(selection == i ? .white : pal.cInkSoft)
+                        .background(selection == i ? pal.cAccent : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).help(tabs[i].help)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
 struct SidebarView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var theme: ThemeManager
@@ -83,6 +107,27 @@ struct SidebarView: View {
     var pal: Pal { theme.pal }
 
     var body: some View {
+        VStack(spacing: 0) {
+            filesPane
+            footer
+        }
+        .frame(width: 250)
+        .frame(maxHeight: .infinity)
+        .background {
+            VisualEffectView(material: .sidebar, cornerRadius: 13)
+                .overlay(pal.cSidebar.opacity(0.9))   // ~90% opaque: keeps a hint of vibrancy, hides the desktop
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
+            .strokeBorder(pal.cRule.opacity(0.35), lineWidth: 1))
+        .shadow(color: .black.opacity(0.28), radius: 18, x: 0, y: 6)
+        .padding(.top, 6)
+        .padding(.leading, 12)
+        .padding(.bottom, 12)
+        .padding(.trailing, 4)
+    }
+
+    var filesPane: some View {
         VStack(spacing: 0) {
             HStack {
                 Text(store.hasFolder ? store.rootName.uppercased() : "NO FOLDER")
@@ -125,35 +170,23 @@ struct SidebarView: View {
             }
             .onDrop(of: [.text], isTargeted: $rootDrop) { handleSidebarDrop($0, into: "", store: store) }
             .overlay(rootDrop ? RoundedRectangle(cornerRadius: 8).strokeBorder(pal.cAccent.opacity(0.4), lineWidth: 1.5).padding(4) : nil)
+        }
+    }
 
-            HStack {
-                Button("Open…") { store.openFolderPanel() }
+    var footer: some View {
+        HStack {
+            Button("Open…") { store.openFolderPanel() }
+                .buttonStyle(.plain).font(.system(size: 11)).foregroundColor(pal.cInkFaint)
+                .help("Open a different folder (⌘O)")
+            Spacer()
+            if store.hasFolder {
+                Button("\(store.files.count) \(store.files.count == 1 ? "file" : "files")") { store.reveal() }
                     .buttonStyle(.plain).font(.system(size: 11)).foregroundColor(pal.cInkFaint)
-                    .help("Open a different folder (⌘O)")
-                Spacer()
-                if store.hasFolder {
-                    Button("\(store.files.count) \(store.files.count == 1 ? "file" : "files")") { store.reveal() }
-                        .buttonStyle(.plain).font(.system(size: 11)).foregroundColor(pal.cInkFaint)
-                        .help("Reveal in Finder")
-                }
+                    .help("Reveal in Finder")
             }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .overlay(Rectangle().frame(height: 1).foregroundColor(pal.cRule), alignment: .top)
         }
-        .frame(width: 250)
-        .frame(maxHeight: .infinity)
-        .background {
-            VisualEffectView(material: .sidebar, cornerRadius: 13)
-                .overlay(pal.cSidebar.opacity(0.9))   // ~90% opaque: keeps a hint of vibrancy, hides the desktop
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous)
-            .strokeBorder(pal.cRule.opacity(0.35), lineWidth: 1))
-        .shadow(color: .black.opacity(0.28), radius: 18, x: 0, y: 6)
-        .padding(.top, 6)
-        .padding(.leading, 12)
-        .padding(.bottom, 12)
-        .padding(.trailing, 4)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .overlay(Rectangle().frame(height: 1).foregroundColor(pal.cRule), alignment: .top)
     }
 }
 
@@ -457,6 +490,7 @@ struct ContentView: View {
     @AppStorage("iliad.spellcheck") private var spellcheck = true
     @AppStorage("iliad.showStats") private var showStats = true
     @AppStorage("iliad.zen") private var zen = false
+    @AppStorage("iliad.bookMode") private var bookMode = false
     @AppStorage("iliad.showTerminal") private var showTerminal = false
     @AppStorage("iliad.termHeight") private var termHeight: Double = 260
     @AppStorage("iliad.zoom") private var zoom: Double = 1.0
@@ -495,6 +529,7 @@ struct ContentView: View {
     }
 
     let poll = Timer.publish(every: 1.6, on: .main, in: .common).autoconnect()
+    let bookInspectorWidth: CGFloat = 269   // inspector frame + divider
     var pal: Pal { theme.pal }
 
     var sidebarVisible: Bool { (showSidebar && !zen) || peekSidebar }   // zen hides it; the left-edge peek brings it back
@@ -603,6 +638,13 @@ struct ContentView: View {
                     toolBtn(theme.dark ? "sun.max" : "moon", false, "Toggle light / dark (⌘D)") { theme.toggle() }
                     themeMenu
                 }
+                // Book / Edit mode toggle
+                bubble {
+                    toolBtn("book", bookMode, bookMode ? "Edit Mode" : "Book Mode") {
+                        store.commitLive()   // fold unsaved edits into currentText before re-mounting the editor
+                        withAnimation(.easeOut(duration: 0.2)) { bookMode.toggle() }
+                    }
+                }
             }
             .contentShape(Rectangle())
             .onContinuousHover { phase in
@@ -616,7 +658,8 @@ struct ContentView: View {
             }
         }
         .padding(.top, inset)
-        .padding(.trailing, inset + 16)   // clear the scrollbar gutter
+        // Anchor to the canvas, not the window: when the book inspector is open, shift in by its width.
+        .padding(.trailing, inset + 16 + (bookMode ? bookInspectorWidth : 0))
     }
 
     // A single rounded segment of the toolbar.
@@ -748,6 +791,8 @@ struct ContentView: View {
                         emptyState(icon: "folder", title: "Open a folder", subtitle: "Iliad reads the files in a folder you choose.", button: "Open Folder…") { store.openFolderPanel() }
                     } else if store.currentPath == nil {
                         emptyState(icon: "doc.text", title: "No file open", subtitle: "Select a file from the library on the left.", button: nil) {}
+                    } else if bookMode {
+                        BookModeView(markdown: store.currentText, pal: pal, root: store.root)
                     } else {
                         EditorView(text: store.currentText, docID: store.currentPath ?? "",
                                    token: store.loadToken, pal: pal,
@@ -813,9 +858,9 @@ struct ContentView: View {
             case "typewriter": typewriter.toggle()
             case "zen": withAnimation { zen.toggle() }
             case "terminal": toggleTerminal()
-            case "zoomIn": zoom = min(2.6, zoom + 0.1)
-            case "zoomOut": zoom = max(0.6, zoom - 0.1)
-            case "zoomReset": zoom = 1.0
+            case "zoomIn": if !bookMode { zoom = min(2.6, zoom + 0.1) }     // Book Mode handles zoom itself
+            case "zoomOut": if !bookMode { zoom = max(0.6, zoom - 0.1) }
+            case "zoomReset": if !bookMode { zoom = 1.0 }
             default: break
             }
         }
@@ -825,6 +870,7 @@ struct ContentView: View {
 extension Notification.Name {
     static let iliadCommand = Notification.Name("IliadCommand")
     static let iliadDiffNav = Notification.Name("IliadDiffNav")   // bottom-bar up/down navigation
+    static let iliadGoto = Notification.Name("IliadGoto")          // outline -> scroll editor to a char offset
 }
 
 // Native Liquid Glass on macOS 26+, the hand-built approximation on older systems.

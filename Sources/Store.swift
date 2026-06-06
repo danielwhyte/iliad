@@ -162,6 +162,15 @@ final class Store: ObservableObject {
     }
     func flushSave() { if isDirty { saveWork?.cancel(); performSave() } }
 
+    // Fold live edits into currentText (and save) so a view that re-mounts the editor — e.g. switching
+    // to Book Mode and back — sees the latest text instead of the stale load-time copy. Safe: the editor
+    // only reloads on a loadToken change, so updating currentText here doesn't disturb typing.
+    func commitLive() {
+        guard currentPath != nil, isDirty else { return }
+        if currentText != liveText { currentText = liveText }
+        flushSave()
+    }
+
     // ⌘S — writes immediately and flashes a "Saved" confirmation, even though saving is automatic.
     @Published var savedFlash = false
     private var flashWork: DispatchWorkItem?
