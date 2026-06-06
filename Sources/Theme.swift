@@ -101,8 +101,10 @@ enum Fonts {
         return ps
     }
 
-    static func serif(_ size: CGFloat, weight: CGFloat = 400, italic: Bool = false, opticalSize: CGFloat? = nil) -> NSFont {
-        switch family {
+    // `family: nil` uses the app's current font; pass an explicit family (e.g. for Book Mode) to override.
+    static func serif(_ size: CGFloat, weight: CGFloat = 400, italic: Bool = false, opticalSize: CGFloat? = nil, family: String? = nil) -> NSFont {
+        let fam = family ?? Fonts.family
+        switch fam {
         case "Literata":      return literata(size, weight: weight, italic: italic, opticalSize: opticalSize)
         case "New York":      return sysFont(size, weight: weight, italic: italic, design: .serif)
         case "San Francisco": return sysFont(size, weight: weight, italic: italic, design: .default)
@@ -115,8 +117,8 @@ enum Fonts {
             var traits: NSFontTraitMask = []
             if italic { traits.insert(.italicFontMask) }
             let w = weight >= 600 ? 9 : 5
-            return NSFontManager.shared.font(withFamily: family, traits: traits, weight: w, size: size)
-                ?? NSFont(name: family, size: size) ?? NSFont.systemFont(ofSize: size)
+            return NSFontManager.shared.font(withFamily: fam, traits: traits, weight: w, size: size)
+                ?? NSFont(name: fam, size: size) ?? NSFont.systemFont(ofSize: size)
         }
     }
 
