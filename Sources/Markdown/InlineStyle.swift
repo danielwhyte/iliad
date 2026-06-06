@@ -36,6 +36,11 @@ extension EditorView.Coordinator {
             marker(ts, pal, shift(NSRange(location: m.range.location, length: 1), off), active)   // [
             let tail = NSRange(location: NSMaxRange(m.range(at: 1)), length: NSMaxRange(m.range) - NSMaxRange(m.range(at: 1)))
             marker(ts, pal, shift(tail, off), active)   // ](url)
+            // Mid-sentence link: widen the space before it so the margin ↗ button has room (not on the prev word).
+            let inline = !nsLine.substring(to: m.range.location).trimmingCharacters(in: .whitespaces).isEmpty
+            if inline, !active, m.range.location > 0 {
+                ts.addAttribute(.kern, value: 20 as CGFloat, range: shift(NSRange(location: m.range.location - 1, length: 1), off))
+            }
         }
     }
 }

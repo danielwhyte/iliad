@@ -2,6 +2,17 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+// A drag for a sidebar item: carries the absolute file URL (so it can be dropped into the terminal
+// or Finder) plus the relative path string (used by the in-app move between folders).
+func dragProvider(_ relativePath: String, store: Store) -> NSItemProvider {
+    let p = NSItemProvider()
+    if let root = store.root {
+        p.registerObject(root.appendingPathComponent(relativePath) as NSURL, visibility: .all)
+    }
+    p.registerObject(relativePath as NSString, visibility: .all)
+    return p
+}
+
 // Loads a dropped item-provider's path string and moves it into `folder` on the main actor.
 func handleSidebarDrop(_ providers: [NSItemProvider], into folder: String, store: Store) -> Bool {
     guard let p = providers.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else { return false }
@@ -209,7 +220,7 @@ struct FolderRow: View {
             .background(RoundedRectangle(cornerRadius: 5).fill(dropTargeted ? pal.cAccent.opacity(0.25) : (store.selectedFolder == node.path ? pal.cAccent.opacity(0.12) : .clear)))
             .contentShape(Rectangle())
             .onHover { hover = $0 }
-            .onDrag { NSItemProvider(object: node.path as NSString) }
+            .onDrag { dragProvider(node.path, store: store) }
             .onDrop(of: [.text], isTargeted: $dropTargeted) { handleSidebarDrop($0, into: node.path, store: store) }
             .onTapGesture {   // immediate single tap; double = rename
                 let now = Date()
@@ -307,7 +318,7 @@ struct FileRow: View {
         .background(RoundedRectangle(cornerRadius: 5).fill(active ? pal.cAccent.opacity(0.15) : (hover ? pal.cInk.opacity(0.05) : .clear)))
         .contentShape(Rectangle())
         .onHover { hover = $0 }
-        .onDrag { NSItemProvider(object: meta.path as NSString) }
+        .onDrag { dragProvider(meta.path, store: store) }
         .onTapGesture {   // single tap acts immediately (no double-tap disambiguation lag); double = rename
             let now = Date()
             if now.timeIntervalSince(lastTap) < 0.3 {

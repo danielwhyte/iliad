@@ -165,6 +165,15 @@ final class ColumnTextView: NSTextView {
         super.viewDidEndLiveResize()
     }
 
+    // I-beam only over the reading column; the empty side margins get the normal arrow cursor.
+    // NSTextView drives its cursor through cursorUpdate (not cursor rects), so override it here.
+    override func cursorUpdate(with event: NSEvent) {
+        let x = convert(event.locationInWindow, from: nil).x
+        let side = textContainerInset.width
+        let colW = textContainer?.size.width ?? bounds.width
+        if x < side || x > side + colW { NSCursor.arrow.set() } else { super.cursorUpdate(with: event) }
+    }
+
     override func layout() {
         let viewW = enclosingScrollView?.contentSize.width ?? bounds.width
         // The column is a FIXED width (rounded), centered by the inset. Wrapping depends only on the
@@ -419,7 +428,8 @@ struct EditorView: NSViewRepresentable {
         let marginGutter = MarginGutter()                           // bullets / link buttons in the left margin
         let tableLayer = TableLayer()                               // rendered tables over their source
         private var marginWork: DispatchWorkItem?
-        private var activeTableKey = ""                             // which table block the caret sits in
+        private var tableStateKey = ""                             // per-table widget(0)/raw(1) state
+        var codeBlocks: [NSRange] = []                             // character ranges inside ``` fences
         private var tableEditing = false                           // a table was double-clicked into edit mode
         var changeStarts: [Int] = []            // char location of each changed block (for nav)
         var changeAnchors: [Int] = []           // char location of the first changed word (for pill placement)
@@ -592,15 +602,13 @@ struct EditorView: NSViewRepresentable {
             if parent.typewriter { centerCaret() }
             revealSelectionGlyphs()
             updateActiveLine()
-            // Entering/leaving a table block flips it between the rendered widget and raw source.
-            let caret = textView?.selectedRange().location ?? 0
-            let key = cachedTableRanges.first(where: { NSLocationInRange(caret, $0) || caret == NSMaxRange($0) })
-                .map { "\($0.location)-\($0.length)" } ?? ""
-            if key != activeTableKey {
-                if key.isEmpty { tableEditing = false }   // left every table -> back to the widget
-                activeTableKey = key
-                rebuildTables()
-            }
+            // Flip tables between the rendered widget and raw source as the selection changes.
+            let sel = textView?.selectedRange() ?? NSRange(location: 0, length: 0)
+            let caretInTable = cachedTableRanges.contains { NSLocationInRange(sel.location, $0) || sel.location == NSMaxRange($0) }
+            if tableEditing && !caretInTable { tableEditing = false }   // left every table -> exit edit mode
+            let stateKey = cachedTableRanges.map { tableShowsRaw($0, sel) ? "1" : "0" }.joined()
+            if stateKey != tableStateKey { rebuildTables() }            // widget<->raw changed: rebuild
+            else { reclearWidgetTables() }                              // else just re-hide on selection
         }
 
         // Regenerate glyphs over the changed selection span so concealed markers under the
@@ -672,7 +680,12 @@ struct EditorView: NSViewRepresentable {
             // keep concealed indexes aligned with the edit, then re-highlight the
             // edited paragraph synchronously so typed text never flashes unstyled
             if delta != 0 { concealed.shiftIndexesStarting(at: editedRange.location, by: delta) }
-            highlight(range: ns.paragraphRange(for: editedRange))
+            // If a ``` fence was opened/closed, the in/out-of-code state of other lines changed too,
+            // so restyle the whole document; otherwise just the edited paragraph.
+            let oldBlocks = codeBlocks
+            scanCodeBlocks()
+            highlight(range: codeBlocks != oldBlocks ? NSRange(location: 0, length: ns.length)
+                                                     : ns.paragraphRange(for: editedRange))
             scheduleMargin()
         }
 
@@ -681,6 +694,7 @@ struct EditorView: NSViewRepresentable {
             let ns = ts.string as NSString
             concealed.remove(in: NSRange(location: 0, length: ns.length))
             lastActive = ns.paragraphRange(for: NSRange(location: min(tv.selectedRange().location, ns.length), length: 0))
+            scanCodeBlocks()
             highlight(range: NSRange(location: 0, length: ns.length))
             rebuildMargin()
             rebuildTables()
@@ -693,16 +707,16 @@ struct EditorView: NSViewRepresentable {
         func rebuildTables() {
             guard let tv = textView, let ts = tv.textStorage, !inDiff else { tableLayer.clear(); return }
             tableLayer.clear()
-            let tables = parseTables(tv.string)
+            let tables = parseTables(tv.string).filter { !inCodeBlock($0.range.location) }   // a `|` line in code isn't a table
             cachedTableRanges = tables.map { $0.range }
-            let caret = tv.selectedRange().location
+            let sel = tv.selectedRange()
+            tableStateKey = tables.map { tableShowsRaw($0.range, sel) ? "1" : "0" }.joined()
             let colW = tv.textContainer?.size.width ?? 600
             let pal = parent.pal
             let font = Font(Fonts.serif(parent.baseSize * parent.zoom * 0.92, weight: Fonts.bodyWeight) as CTFont)
             for t in tables {
                 highlight(range: t.range)   // reset the block to its raw (mono) styling
-                let inThis = NSLocationInRange(caret, t.range) || caret == NSMaxRange(t.range)
-                if tableEditing && inThis { continue }   // editing this table -> show raw source
+                if tableShowsRaw(t.range, sel) { continue }   // editing / whole-table selection -> show raw source
                 let host = NSHostingView(rootView: MarkdownTableView(table: t, width: colW, font: font,
                     ink: Color(nsColor: pal.ink), headerInk: Color(nsColor: pal.inkSoft),
                     rule: Color(nsColor: pal.rule), stripe: Color(nsColor: pal.paperEdge),
@@ -726,6 +740,26 @@ struct EditorView: NSViewRepresentable {
             tableLayer.reposition()
         }
 
+        // A table shows its raw Markdown only when you double-clicked into it, or the WHOLE block is
+        // selected. A partial/edge selection keeps the rendered widget (no source leaking through).
+        func tableShowsRaw(_ r: NSRange, _ sel: NSRange) -> Bool {
+            let caretIn = NSLocationInRange(sel.location, r) || sel.location == NSMaxRange(r)
+            let fullySelected = sel.length > 0 && sel.location <= r.location && NSMaxRange(sel) >= NSMaxRange(r)
+            return (tableEditing && caretIn) || fullySelected
+        }
+
+        // Re-hide widget-mode tables after the active-line restyler ran (cheap; no widget rebuild),
+        // so touching a table with a selection doesn't expose its source.
+        func reclearWidgetTables() {
+            guard let tv = textView, let ts = tv.textStorage, !inDiff, !cachedTableRanges.isEmpty else { return }
+            let sel = tv.selectedRange()
+            highlighting = true; ts.beginEditing()
+            for r in cachedTableRanges where NSMaxRange(r) <= ts.length {
+                if !tableShowsRaw(r, sel) { ts.addAttribute(.foregroundColor, value: NSColor.clear, range: r) }
+            }
+            ts.endEditing(); highlighting = false
+        }
+
         // Click a table cell: reveal the raw source and land the caret in that cell's text.
         func enterTableEdit(_ table: MDTable, row: Int, col: Int) {
             guard let tv = textView else { return }
@@ -737,7 +771,6 @@ struct EditorView: NSViewRepresentable {
                 loc = lr.location + Self.cellOffset(in: ns.substring(with: lr), column: col)
             }
             tv.setSelectedRange(NSRange(location: min(loc, ns.length), length: 0))
-            activeTableKey = "\(table.range.location)-\(table.range.length)"
             tv.window?.makeFirstResponder(tv)
             rebuildTables()
         }
@@ -804,6 +837,7 @@ struct EditorView: NSViewRepresentable {
             var entries: [MarginEntry] = []
             ns.enumerateSubstrings(in: NSRange(location: 0, length: ns.length), options: .byParagraphs) { sub, range, _, _ in
                 guard let line = sub, !line.isEmpty else { return }
+                if self.inCodeBlock(range.location) { return }   // no bullets/links/HR inside fenced code
                 let nsLine = line as NSString
                 let full = NSRange(location: 0, length: nsLine.length)
                 // horizontal rule -> a line across the column
@@ -820,9 +854,9 @@ struct EditorView: NSViewRepresentable {
                     entries.append(MarginEntry(anchor: range.location + NSMaxRange(tm.range), width: bulletSize + 4,
                         view: AnyView(MarginCheckbox(checked: checked,
                             onColor: Color(nsColor: pal.accent), offColor: Color(nsColor: pal.inkSoft),
-                            size: bulletSize * 0.95,
+                            size: bulletSize * 0.9,
                             toggle: { [weak self] in self?.toggleCheckbox(boxRange) })),
-                        cursor: .pointingHand))
+                        cursor: .pointingHand, centerVertically: true, pinLeft: true))
                 } else if !isCodeFence, let m = regex("^(\\s*)([-*+]|(\\d+)\\.)(\\s+)").firstMatch(in: line, range: full) {
                     let ordered = m.range(at: 3).location != NSNotFound
                     let label = ordered ? nsLine.substring(with: m.range(at: 3)) + "." : "•"
@@ -833,9 +867,10 @@ struct EditorView: NSViewRepresentable {
                 }
                 for lm in regex("\\[[^\\]\\n]+\\]\\(([^)\\n]+)\\)").matches(in: line, range: full) {
                     guard let url = URL(string: nsLine.substring(with: lm.range(at: 1))), url.scheme != nil else { continue }
-                    entries.append(MarginEntry(anchor: range.location + lm.range.location + 1, width: 24,
+                    let inline = !nsLine.substring(to: lm.range.location).trimmingCharacters(in: .whitespaces).isEmpty
+                    entries.append(MarginEntry(anchor: range.location + lm.range.location + 1, width: 18,
                         view: AnyView(MarginLinkButton(url: url, color: Color(nsColor: pal.accent))),
-                        cursor: .pointingHand))
+                        cursor: .pointingHand, centerVertically: true, inlineGap: inline))
                 }
             }
             marginGutter.build(entries)

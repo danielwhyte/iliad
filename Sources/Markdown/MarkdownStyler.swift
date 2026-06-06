@@ -32,6 +32,7 @@ extension EditorView.Coordinator {
     func styleLine(_ ts: NSTextStorage, _ line: String, _ subRange: NSRange, _ pal: Pal, active: Bool) {
         let b = parent.baseSize * parent.zoom
         let nsLine = line as NSString
+        if inCodeBlock(subRange.location) { styleCodeLine(ts, line, subRange, pal); return }
         if styleTableRow(ts, line, nsLine, subRange, pal, b) { return }
         if styleHorizontalRule(ts, line, nsLine, subRange, pal, active) { return }
         if styleHeading(ts, line, nsLine, subRange, pal, b, active) { return }
@@ -54,10 +55,12 @@ extension EditorView.Coordinator {
         return true
     }
 
-    // Horizontal rule: conceal the dashes (a line is drawn across the column in the gutter).
+    // Horizontal rule: a line is drawn across the column in the gutter. Hide the dashes with a clear
+    // color (rather than concealing them to null glyphs, which collapses the line and makes the rule
+    // anchor to the wrong line); revealed dimmed when the line is being edited.
     private func styleHorizontalRule(_ ts: NSTextStorage, _ line: String, _ nsLine: NSString, _ subRange: NSRange, _ pal: Pal, _ active: Bool) -> Bool {
         guard regex("^\\s*([-*_])(\\s*\\1){2,}\\s*$").firstMatch(in: line, range: full(nsLine)) != nil else { return false }
-        marker(ts, pal, subRange, active)
+        ts.addAttribute(.foregroundColor, value: active ? pal.inkFaint : NSColor.clear, range: subRange)
         return true
     }
 
@@ -82,12 +85,15 @@ extension EditorView.Coordinator {
 
     // List bullet/number marker + task checkbox markup (both rendered in the margin gutter).
     private func styleListMarker(_ ts: NSTextStorage, _ line: String, _ nsLine: NSString, _ subRange: NSRange, _ pal: Pal, _ active: Bool) {
-        guard regex("^(\\s*)([-*+]|\\d+\\.)(\\s+)").firstMatch(in: line, range: full(nsLine)) != nil else { return }
-        let m = regex("^(\\s*)([-*+]|\\d+\\.)(\\s+)").firstMatch(in: line, range: full(nsLine))!
-        marker(ts, pal, shift(m.range(at: 2), subRange.location), active)
-        if let tm = regex("^(\\s*)[-*+](\\s+)(\\[[ xX]\\])(\\s?)").firstMatch(in: line, range: full(nsLine)) {
+        guard let m = regex("^(\\s*)([-*+]|\\d+\\.)(\\s+)").firstMatch(in: line, range: full(nsLine)) else { return }
+        let task = regex("^(\\s*)[-*+](\\s+)(\\[[ xX]\\])(\\s?)").firstMatch(in: line, range: full(nsLine))
+        // A task line renders as a margin checkbox. Keep its `- [x] ` markup hidden even while the line
+        // is being edited, so the checkbox stays locked in place (revealing it would shift the text and
+        // drag the checkbox along with it).
+        marker(ts, pal, shift(m.range(at: 2), subRange.location), task == nil ? active : false)
+        if let tm = task {
             let box = NSRange(location: tm.range(at: 3).location, length: tm.range(at: 3).length + tm.range(at: 4).length)
-            marker(ts, pal, shift(box, subRange.location), active)
+            marker(ts, pal, shift(box, subRange.location), false)
         }
     }
 }

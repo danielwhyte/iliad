@@ -8,6 +8,9 @@ struct MarginEntry {
     let view: AnyView
     var cursor: NSCursor = .arrow
     var fullWidth: Bool = false   // span the whole column (e.g. a horizontal rule) instead of hanging in the margin
+    var centerVertically: Bool = false   // icons (checkbox, link) center on the line; text bullets top-align
+    var inlineGap: Bool = false   // sit in a reserved gap just before the anchor (mid-line link buttons)
+    var pinLeft: Bool = false     // pin to the left margin via the line fragment (stable; ignores content glyphs)
 }
 
 // A horizontal rule that fills the reading column, vertically centered on its line.
@@ -23,7 +26,13 @@ struct HRLine: View {
 final class MarginHost: NSHostingView<AnyView> {
     var cursor: NSCursor = .arrow
     override func resetCursorRects() { addCursorRect(bounds, cursor: cursor) }
-    // Re-arm the cursor rect after the frame is positioned, so it covers the whole button.
+    // A .cursorUpdate tracking area reliably overrides the text view's I-beam while over this view.
+    override func cursorUpdate(with event: NSEvent) { cursor.set() }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.cursorUpdate, .activeAlways, .inVisibleRect], owner: self))
+    }
     override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); window?.invalidateCursorRects(for: self) }
     override func setFrameOrigin(_ newOrigin: NSPoint) { super.setFrameOrigin(newOrigin); window?.invalidateCursorRects(for: self) }
 }
@@ -33,7 +42,7 @@ final class MarginHost: NSHostingView<AnyView> {
 // `build` creates the views (call on content change); `reposition` only moves them (call on layout).
 final class MarginGutter {
     weak var textView: NSTextView?
-    private struct Hosted { let anchor: Int; let width: CGFloat; let host: NSView; let fullWidth: Bool }
+    private struct Hosted { let anchor: Int; let width: CGFloat; let host: NSView; let fullWidth: Bool; let centerV: Bool; let inlineGap: Bool; let pinLeft: Bool }
     private var hosted: [Hosted] = []
 
     func clear() { hosted.forEach { $0.host.removeFromSuperview() }; hosted = [] }
@@ -46,7 +55,7 @@ final class MarginGutter {
             host.cursor = e.cursor
             host.translatesAutoresizingMaskIntoConstraints = true
             tv.addSubview(host)
-            return Hosted(anchor: e.anchor, width: e.width, host: host, fullWidth: e.fullWidth)
+            return Hosted(anchor: e.anchor, width: e.width, host: host, fullWidth: e.fullWidth, centerV: e.centerVertically, inlineGap: e.inlineGap, pinLeft: e.pinLeft)
         }
         reposition()
     }
@@ -70,11 +79,26 @@ final class MarginGutter {
                 h.host.frame = NSRect(x: origin.x, y: origin.y + frag.minY, width: columnW, height: frag.height)
                 continue
             }
+            if h.pinLeft {
+                // Pin to the left margin off the LINE fragment (not the content glyph), so editing the
+                // line — which conceals/reveals markers on a deferred pass — can't make it drift.
+                let lf = lm.lineFragmentRect(forGlyphAt: gr.location, effectiveRange: nil)
+                let viewH = max(h.host.fittingSize.height, 14)
+                let y = origin.y + lf.minY + (h.centerV ? (lf.height - viewH) / 2 : 0)
+                h.host.frame = NSRect(x: origin.x - h.width - 3, y: y, width: h.width, height: viewH)
+                continue
+            }
             let frag = lm.boundingRect(forGlyphRange: NSRange(location: gr.location, length: max(1, gr.length)), in: tc)
             let viewH = max(h.host.fittingSize.height, 14)
             // Body text sits at the TOP of the line box (interline spacing is below it), and the
             // marker uses the same font, so top-aligning the two makes their baselines match.
-            let y = origin.y + frag.minY
+            // Icons (checkbox, link) center on the line instead, so they sit level with the text.
+            let y = h.centerV ? origin.y + frag.minY + (frag.height - viewH) / 2 : origin.y + frag.minY
+            if h.inlineGap {
+                // Mid-line link button: sit in the reserved gap just before the link text (no stacking).
+                h.host.frame = NSRect(x: origin.x + frag.minX - h.width - 3, y: y, width: h.width, height: viewH)
+                continue
+            }
             // Hang just left of the line's first glyph (frag.minX includes any nesting indent),
             // so nested items inset with their text. Multiple items on a line stack leftward.
             if abs(y - prevLineY) < 1 { stack += h.width + 4 } else { stack = 0; prevLineY = y }
@@ -129,9 +153,9 @@ struct MarginLinkButton: View {
     var body: some View {
         Button { NSWorkspace.shared.open(url) } label: {
             Image(systemName: "arrow.up.right")
-                .font(.system(size: 12, weight: .bold))
+                .font(.system(size: 9, weight: .bold))
                 .foregroundColor(color)
-                .frame(width: 24, height: 24)
+                .frame(width: 18, height: 18)
                 .background(Circle().fill(color.opacity(hover ? 0.22 : 0.12)))
         }
         .buttonStyle(.plain)
