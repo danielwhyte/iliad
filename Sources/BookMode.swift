@@ -36,6 +36,7 @@ struct BookStyle: Equatable {
     var bodySize: CGFloat = 12        // points
     var leading: CGFloat = 18         // absolute leading in points (baseline-to-baseline), InDesign-style
     var justified: Bool = true
+    var hyphenate: Bool = true
     var indentParagraphs: Bool = true
     var bodyFont: String = "Literata"      // book fonts are independent of the editor's font
     var headingFont: String = "Literata"
@@ -74,7 +75,7 @@ enum BookFormatter {
             ps.alignment = s.justified ? .justified : .natural
             ps.minimumLineHeight = s.leading; ps.maximumLineHeight = s.leading   // absolute leading
             ps.paragraphSpacing = s.bodySize * 0.2
-            ps.hyphenationFactor = s.justified ? 1 : 0   // hyphenate justified text to even out word spacing
+            ps.hyphenationFactor = s.hyphenate ? 1 : 0   // hyphenate to even out word spacing
             if s.indentParagraphs && !afterHeading { ps.firstLineHeadIndent = s.bodySize * 1.6 }
             let a = inline(joined, base: Fonts.serif(s.bodySize, weight: 400, family: s.bodyFont), ink: ink, soft: soft, size: s.bodySize, family: s.bodyFont)
             a.addAttribute(.ligature, value: 1, range: NSRange(location: 0, length: a.length))   // standard ligatures
@@ -265,6 +266,16 @@ final class BookPagesView: NSView {
     var showGuides = true
     override var isFlipped: Bool { true }
 
+    // Keep the layer rasterizing at the screen's pixel density × the zoom, so glyphs stay crisp
+    // (SwiftUI hosts us layer-backed; a stale 1× contentsScale is what makes text look soft).
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); fixScale() }
+    override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); fixScale() }
+    func fixScale() {
+        guard let layer = layer, let w = window else { return }
+        let scale = w.backingScaleFactor * (enclosingScrollView?.magnification ?? 1)
+        if abs(layer.contentsScale - scale) > 0.01 { layer.contentsScale = scale; needsDisplay = true }
+    }
+
     // Spread index (0-based) and which half a 1-based page occupies (recto = right).
     private func place(_ n: Int) -> (spread: Int, recto: Bool) {
         let recto = n % 2 == 1
@@ -359,10 +370,17 @@ struct BookCanvas: NSViewRepresentable {
         scroll.drawsBackground = true
         scroll.allowsMagnification = true
         scroll.documentView = BookPagesView()
+        // Re-rasterize crisply after a pinch-zoom settles.
+        context.coordinator.token = NotificationCenter.default.addObserver(
+            forName: NSScrollView.didEndLiveMagnifyNotification, object: scroll, queue: .main) { _ in
+            (scroll.documentView as? BookPagesView)?.fixScale()
+        }
         rebuild(scroll)
         return scroll
     }
     func updateNSView(_ scroll: NSScrollView, context: Context) { rebuild(scroll) }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    final class Coordinator { var token: Any?; deinit { if let t = token { NotificationCenter.default.removeObserver(t) } } }
 
     private func rebuild(_ scroll: NSScrollView) {
         scroll.backgroundColor = pal.paperEdge
@@ -371,6 +389,7 @@ struct BookCanvas: NSViewRepresentable {
         pages.showGuides = showGuides
         let attr = BookFormatter.attributed(markdown, style, ink: .black, soft: NSColor(white: 0.35, alpha: 1))
         pages.render(BookLayout(attr, style))   // CenteringClipView keeps it centered
+        pages.fixScale()                          // keep rasterization at screen × zoom resolution
     }
 }
 
@@ -425,6 +444,7 @@ extension BookStyle {
         bodySize: \(trim(bodySize))
         leading: \(trim(leading))
         justified: \(justified)
+        hyphenate: \(hyphenate)
         indentParagraphs: \(indentParagraphs)
         headingSizes: \(headingSizes.map { trim($0) }.joined(separator: ","))
         tableBorder: \(trim(tableBorder))
@@ -452,6 +472,7 @@ extension BookStyle {
             case "bodySize": if let d = Double(v) { bodySize = CGFloat(d) }
             case "leading": if let d = Double(v) { leading = CGFloat(d) }
             case "justified": justified = (v == "true")
+            case "hyphenate": hyphenate = (v == "true")
             case "indentParagraphs": indentParagraphs = (v == "true")
             case "headingSizes":
                 let nums = v.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)).map { CGFloat($0) } }
@@ -601,6 +622,7 @@ struct BookModeView: View {
                 slider("Size", dbl(\.bodySize), 8...18, unit: "pt")
                 slider("Leading", dbl(\.leading), 6...48, unit: "pt", decimals: 1)
                 Toggle("Justify text", isOn: $style.justified).controlSize(.small)
+                Toggle("Hyphenate", isOn: $style.hyphenate).controlSize(.small)
                 Toggle("Indent paragraphs", isOn: $style.indentParagraphs).controlSize(.small)
             }
             section("HEADINGS") {
