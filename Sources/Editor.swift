@@ -142,6 +142,7 @@ final class ColumnTextView: NSTextView {
     var columnMeasure: CGFloat = 680
     var minPad: CGFloat = 24
     var topInset: CGFloat = 60
+    var onLayout: (() -> Void)?
     private var unsuppressWork: DispatchWorkItem?
 
     // Block AppKit's auto re-scroll for a short burst around any width change (covers the whole
@@ -164,6 +165,15 @@ final class ColumnTextView: NSTextView {
         super.viewDidEndLiveResize()
     }
 
+    // I-beam only over the reading column; the empty side margins get the normal arrow cursor.
+    // NSTextView drives its cursor through cursorUpdate (not cursor rects), so override it here.
+    override func cursorUpdate(with event: NSEvent) {
+        let x = convert(event.locationInWindow, from: nil).x
+        let side = textContainerInset.width
+        let colW = textContainer?.size.width ?? bounds.width
+        if x < side || x > side + colW { NSCursor.arrow.set() } else { super.cursorUpdate(with: event) }
+    }
+
     override func layout() {
         let viewW = enclosingScrollView?.contentSize.width ?? bounds.width
         // The column is a FIXED width (rounded), centered by the inset. Wrapping depends only on the
@@ -174,7 +184,7 @@ final class ColumnTextView: NSTextView {
         let tc = textContainer
         let widthChanged = tc != nil && abs(tc!.size.width - colW) > 0.5
         let insetChanged = abs(textContainerInset.width - side) > 0.5 || textContainerInset.height != topInset
-        guard widthChanged || insetChanged else { super.layout(); return }
+        guard widthChanged || insetChanged else { super.layout(); onLayout?(); return }
         holdScroll()   // suppress the inset-change re-scroll for this resize burst
         let clip = enclosingScrollView?.contentView
         let savedY = clip?.bounds.origin.y ?? 0
@@ -185,6 +195,7 @@ final class ColumnTextView: NSTextView {
             clip.setBoundsOrigin(NSPoint(x: clip.bounds.origin.x, y: savedY))
             enclosingScrollView?.reflectScrolledClipView(clip)
         }
+        onLayout?()   // keep margin elements aligned to their lines
     }
 
     // Keep the caret at the glyph's natural height, centered in the (taller) line.
@@ -210,6 +221,27 @@ final class ColumnTextView: NSTextView {
     override func setNeedsDisplay(_ invalidRect: NSRect, avoidAdditionalLayout flag: Bool) {
         // expand the invalidation a touch so the shorter caret clears cleanly
         super.setNeedsDisplay(invalidRect.insetBy(dx: -1, dy: -2), avoidAdditionalLayout: flag)
+    }
+
+    // Paste a bare URL as a Markdown link. With a selection, the selected text becomes the label;
+    // otherwise the URL is used as both label and target, e.g. [https://x.com](https://x.com).
+    override func paste(_ sender: Any?) {
+        let s = (NSPasteboard.general.string(forType: .string) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if Self.isSingleURL(s) {
+            let sel = selectedRange()
+            let selText = (string as NSString).substring(with: sel)
+            let md = "[\(selText.isEmpty ? s : selText)](\(s))"
+            insertText(md, replacementRange: sel)   // normal text-change path: undo, autosave, restyle
+            return
+        }
+        super.paste(sender)
+    }
+
+    static func isSingleURL(_ s: String) -> Bool {
+        guard !s.isEmpty, !s.contains(where: { $0.isWhitespace }),
+              let url = URL(string: s), let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https", url.host != nil else { return false }
+        return true
     }
 }
 
@@ -293,6 +325,15 @@ struct EditorView: NSViewRepresentable {
         lm.delegate = context.coordinator   // for concealing markdown markers
         scroll.documentView = tv
         context.coordinator.textView = tv
+        context.coordinator.marginGutter.textView = tv
+        context.coordinator.tableLayer.textView = tv
+        // Reposition in the SAME layout pass as the text (no async lag), so the margin elements and
+        // table widgets stay glued to their lines when the column resizes. ensureLayout:false because
+        // the text is already laid out at this point (avoids re-entering layout).
+        tv.onLayout = { [weak c = context.coordinator] in
+            c?.marginGutter.reposition(ensureLayout: false)
+            c?.tableLayer.reposition(ensureLayout: false)
+        }
 
         applyTheme(tv, scroll)
         tv.string = text
@@ -382,8 +423,14 @@ struct EditorView: NSViewRepresentable {
         var pendingRestore: CGPoint? = nil
         private var inDiff = false
         private var highlighting = false
-        private let concealed = NSMutableIndexSet()                 // char indexes whose glyphs are hidden
+        let concealed = NSMutableIndexSet()                 // char indexes whose glyphs are hidden
         private var lastActive = NSRange(location: NSNotFound, length: 0)
+        let marginGutter = MarginGutter()                           // bullets / link buttons in the left margin
+        let tableLayer = TableLayer()                               // rendered tables over their source
+        private var marginWork: DispatchWorkItem?
+        private var tableStateKey = ""                             // per-table widget(0)/raw(1) state
+        var codeBlocks: [NSRange] = []                             // character ranges inside ``` fences
+        private var tableEditing = false                           // a table was double-clicked into edit mode
         var changeStarts: [Int] = []            // char location of each changed block (for nav)
         var changeAnchors: [Int] = []           // char location of the first changed word (for pill placement)
         var changeIds: [Int] = []               // parallel block ids (for the per-change pills)
@@ -457,6 +504,7 @@ struct EditorView: NSViewRepresentable {
         func renderDiff(_ review: Review) {
             guard let tv = textView, let ts = tv.textStorage else { return }
             inDiff = true
+            marginGutter.clear(); tableLayer.clear()   // diff view replaces the document; both rebuild on exit
             startDiffNavObserver(); navIndex = -1
             concealed.remove(in: NSRange(location: 0, length: (ts.string as NSString).length))
             tv.linkTextAttributes = [.foregroundColor: parent.pal.accent, .underlineStyle: 0, .cursor: NSCursor.pointingHand]
@@ -554,6 +602,13 @@ struct EditorView: NSViewRepresentable {
             if parent.typewriter { centerCaret() }
             revealSelectionGlyphs()
             updateActiveLine()
+            // Flip tables between the rendered widget and raw source as the selection changes.
+            let sel = textView?.selectedRange() ?? NSRange(location: 0, length: 0)
+            let caretInTable = cachedTableRanges.contains { NSLocationInRange(sel.location, $0) || sel.location == NSMaxRange($0) }
+            if tableEditing && !caretInTable { tableEditing = false }   // left every table -> exit edit mode
+            let stateKey = cachedTableRanges.map { tableShowsRaw($0, sel) ? "1" : "0" }.joined()
+            if stateKey != tableStateKey { rebuildTables() }            // widget<->raw changed: rebuild
+            else { reclearWidgetTables() }                              // else just re-hide on selection
         }
 
         // Regenerate glyphs over the changed selection span so concealed markers under the
@@ -625,7 +680,13 @@ struct EditorView: NSViewRepresentable {
             // keep concealed indexes aligned with the edit, then re-highlight the
             // edited paragraph synchronously so typed text never flashes unstyled
             if delta != 0 { concealed.shiftIndexesStarting(at: editedRange.location, by: delta) }
-            highlight(range: ns.paragraphRange(for: editedRange))
+            // If a ``` fence was opened/closed, the in/out-of-code state of other lines changed too,
+            // so restyle the whole document; otherwise just the edited paragraph.
+            let oldBlocks = codeBlocks
+            scanCodeBlocks()
+            highlight(range: codeBlocks != oldBlocks ? NSRange(location: 0, length: ns.length)
+                                                     : ns.paragraphRange(for: editedRange))
+            scheduleMargin()
         }
 
         func highlightAll() {
@@ -633,7 +694,186 @@ struct EditorView: NSViewRepresentable {
             let ns = ts.string as NSString
             concealed.remove(in: NSRange(location: 0, length: ns.length))
             lastActive = ns.paragraphRange(for: NSRange(location: min(tv.selectedRange().location, ns.length), length: 0))
+            scanCodeBlocks()
             highlight(range: NSRange(location: 0, length: ns.length))
+            rebuildMargin()
+            rebuildTables()
+        }
+
+        var cachedTableRanges: [NSRange] = []
+
+        // Render each table block (when the caret isn't inside it) as a widget over its concealed
+        // source. The source text is never changed, so saving stays plain Markdown.
+        func rebuildTables() {
+            guard let tv = textView, let ts = tv.textStorage, !inDiff else { tableLayer.clear(); return }
+            tableLayer.clear()
+            let tables = parseTables(tv.string).filter { !inCodeBlock($0.range.location) }   // a `|` line in code isn't a table
+            cachedTableRanges = tables.map { $0.range }
+            let sel = tv.selectedRange()
+            tableStateKey = tables.map { tableShowsRaw($0.range, sel) ? "1" : "0" }.joined()
+            let colW = tv.textContainer?.size.width ?? 600
+            let pal = parent.pal
+            let font = Font(Fonts.serif(parent.baseSize * parent.zoom * 0.92, weight: Fonts.bodyWeight) as CTFont)
+            for t in tables {
+                highlight(range: t.range)   // reset the block to its raw (mono) styling
+                if tableShowsRaw(t.range, sel) { continue }   // editing / whole-table selection -> show raw source
+                let host = NSHostingView(rootView: MarkdownTableView(table: t, width: colW, font: font,
+                    ink: Color(nsColor: pal.ink), headerInk: Color(nsColor: pal.inkSoft),
+                    rule: Color(nsColor: pal.rule), stripe: Color(nsColor: pal.paperEdge),
+                    accent: Color(nsColor: pal.accent),
+                    onCellEdit: { [weak self] r, c, txt in self?.editTableCell(t, row: r, col: c, text: txt) },
+                    onMdEdit: { [weak self] r, c in self?.enterTableEdit(t, row: r, col: c) }))
+                host.layoutSubtreeIfNeeded()
+                let H = max(host.fittingSize.height, 24)
+                // Hide the raw source and spread the block's lines to the widget's height.
+                let ps = NSMutableParagraphStyle()
+                ps.minimumLineHeight = H / CGFloat(max(1, t.lineCount)); ps.maximumLineHeight = ps.minimumLineHeight
+                ps.lineBreakMode = .byClipping
+                highlighting = true
+                ts.beginEditing()
+                ts.addAttribute(.paragraphStyle, value: ps, range: t.range)
+                ts.addAttribute(.foregroundColor, value: NSColor.clear, range: t.range)
+                ts.endEditing()
+                highlighting = false
+                tableLayer.add(anchor: t.range.location, height: H, host: host)
+            }
+            tableLayer.reposition()
+        }
+
+        // A table shows its raw Markdown only when you double-clicked into it, or the WHOLE block is
+        // selected. A partial/edge selection keeps the rendered widget (no source leaking through).
+        func tableShowsRaw(_ r: NSRange, _ sel: NSRange) -> Bool {
+            let caretIn = NSLocationInRange(sel.location, r) || sel.location == NSMaxRange(r)
+            let fullySelected = sel.length > 0 && sel.location <= r.location && NSMaxRange(sel) >= NSMaxRange(r)
+            return (tableEditing && caretIn) || fullySelected
+        }
+
+        // Re-hide widget-mode tables after the active-line restyler ran (cheap; no widget rebuild),
+        // so touching a table with a selection doesn't expose its source.
+        func reclearWidgetTables() {
+            guard let tv = textView, let ts = tv.textStorage, !inDiff, !cachedTableRanges.isEmpty else { return }
+            let sel = tv.selectedRange()
+            highlighting = true; ts.beginEditing()
+            for r in cachedTableRanges where NSMaxRange(r) <= ts.length {
+                if !tableShowsRaw(r, sel) { ts.addAttribute(.foregroundColor, value: NSColor.clear, range: r) }
+            }
+            ts.endEditing(); highlighting = false
+        }
+
+        // Click a table cell: reveal the raw source and land the caret in that cell's text.
+        func enterTableEdit(_ table: MDTable, row: Int, col: Int) {
+            guard let tv = textView else { return }
+            tableEditing = true
+            let ns = tv.string as NSString
+            var loc = table.range.location
+            if row < table.rowRanges.count {
+                let lr = table.rowRanges[row]
+                loc = lr.location + Self.cellOffset(in: ns.substring(with: lr), column: col)
+            }
+            tv.setSelectedRange(NSRange(location: min(loc, ns.length), length: 0))
+            tv.window?.makeFirstResponder(tv)
+            rebuildTables()
+        }
+
+        // Inline cell edit: write the committed text back into that cell's range in the source line.
+        func editTableCell(_ table: MDTable, row: Int, col: Int, text: String) {
+            guard let tv = textView, let ts = tv.textStorage, row < table.rowRanges.count else { return }
+            let ns = ts.string as NSString
+            let lr = table.rowRanges[row]
+            guard NSMaxRange(lr) <= ns.length else { return }
+            let line = ns.substring(with: lr) as NSString
+            let start = Self.cellOffset(in: ns.substring(with: lr), column: col)
+            var end = line.length
+            var k = start
+            while k < line.length { if line.character(at: k) == 124 { end = k; break }; k += 1 }  // next '|'
+            while end > start, line.character(at: end - 1) == 32 { end -= 1 }                      // trim trailing
+            let docRange = NSRange(location: lr.location + start, length: max(0, end - start))
+            let clean = text.replacingOccurrences(of: "|", with: " ").replacingOccurrences(of: "\n", with: " ")
+            guard NSMaxRange(docRange) <= ns.length, ns.substring(with: docRange) != clean else { return }
+            guard tv.shouldChangeText(in: docRange, replacementString: clean) else { return }
+            ts.replaceCharacters(in: docRange, with: clean)
+            tv.didChangeText()   // re-highlight, autosave, and re-render the table
+        }
+
+        // Character offset of a column's content start within a `| a | b |` source line.
+        static func cellOffset(in line: String, column: Int) -> Int {
+            let ns = line as NSString
+            var pipes: [Int] = []
+            for k in 0..<ns.length where ns.character(at: k) == 124 { pipes.append(k) }  // '|'
+            let leading = line.trimmingCharacters(in: .whitespaces).hasPrefix("|")
+            let pipeIdx = leading ? column : column - 1
+            guard pipeIdx >= 0, pipeIdx < pipes.count else { return 0 }
+            var p = pipes[pipeIdx] + 1
+            while p < ns.length, ns.character(at: p) == 32 { p += 1 }   // skip leading spaces
+            return p
+        }
+
+        // Flip the checkbox character ("x" <-> " ") in place, preserving the caret.
+        func toggleCheckbox(_ range: NSRange) {
+            guard let tv = textView, let ts = tv.textStorage, NSMaxRange(range) <= ts.length else { return }
+            let new = (ts.string as NSString).substring(with: range).lowercased() == "x" ? " " : "x"
+            guard tv.shouldChangeText(in: range, replacementString: new) else { return }
+            ts.replaceCharacters(in: range, with: new)
+            tv.didChangeText()   // fires re-highlight, autosave, and a margin rebuild
+        }
+
+        // Debounced rebuild after edits (scanning the whole doc per keystroke would be wasteful).
+        func scheduleMargin() {
+            marginWork?.cancel()
+            let w = DispatchWorkItem { [weak self] in self?.rebuildMargin(); self?.rebuildTables() }
+            marginWork = w
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: w)
+        }
+
+        // Scan every line for things that want a margin element (list markers, links) and hand them
+        // to the gutter. Anchored to each line's start; the gutter positions them in the left margin.
+        func rebuildMargin() {
+            guard let tv = textView, !inDiff else { return }
+            let pal = parent.pal
+            let bulletSize = parent.baseSize * parent.zoom
+            // Exact body font so the margin marker matches the text's font, size, and weight.
+            let bodyFont = Font(Fonts.serif(bulletSize, weight: Fonts.bodyWeight) as CTFont)
+            let ns = tv.string as NSString
+            var entries: [MarginEntry] = []
+            ns.enumerateSubstrings(in: NSRange(location: 0, length: ns.length), options: .byParagraphs) { sub, range, _, _ in
+                guard let line = sub, !line.isEmpty else { return }
+                if self.inCodeBlock(range.location) { return }   // no bullets/links/HR inside fenced code
+                let nsLine = line as NSString
+                let full = NSRange(location: 0, length: nsLine.length)
+                // horizontal rule -> a line across the column
+                if regex("^\\s*([-*_])(\\s*\\1){2,}\\s*$").firstMatch(in: line, range: full) != nil {
+                    entries.append(MarginEntry(anchor: range.location, width: 0,
+                        view: AnyView(HRLine(color: Color(nsColor: pal.rule))), fullWidth: true))
+                    return
+                }
+                let isCodeFence = line.range(of: "^(\\s*)```", options: .regularExpression) != nil
+                if !isCodeFence, let tm = regex("^(\\s*)[-*+](\\s+)\\[([ xX])\\](\\s+)").firstMatch(in: line, range: full) {
+                    // task list item: a checkbox replaces the bullet
+                    let checked = nsLine.substring(with: tm.range(at: 3)).lowercased() == "x"
+                    let boxRange = NSRange(location: range.location + tm.range(at: 3).location, length: 1)
+                    entries.append(MarginEntry(anchor: range.location + NSMaxRange(tm.range), width: bulletSize + 4,
+                        view: AnyView(MarginCheckbox(checked: checked,
+                            onColor: Color(nsColor: pal.accent), offColor: Color(nsColor: pal.inkSoft),
+                            size: bulletSize * 0.9,
+                            toggle: { [weak self] in self?.toggleCheckbox(boxRange) })),
+                        cursor: .pointingHand, centerVertically: true, pinLeft: true))
+                } else if !isCodeFence, let m = regex("^(\\s*)([-*+]|(\\d+)\\.)(\\s+)").firstMatch(in: line, range: full) {
+                    let ordered = m.range(at: 3).location != NSNotFound
+                    let label = ordered ? nsLine.substring(with: m.range(at: 3)) + "." : "•"
+                    // Anchor to the first VISIBLE char (after the concealed marker), which lays out
+                    // on the item's first line; the marker itself is a zero-width null glyph.
+                    entries.append(MarginEntry(anchor: range.location + m.range.length, width: ordered ? 26 : 14,
+                        view: AnyView(MarginBullet(label: label, color: Color(nsColor: pal.inkSoft), font: bodyFont))))
+                }
+                for lm in regex("\\[[^\\]\\n]+\\]\\(([^)\\n]+)\\)").matches(in: line, range: full) {
+                    guard let url = URL(string: nsLine.substring(with: lm.range(at: 1))), url.scheme != nil else { continue }
+                    let inline = !nsLine.substring(to: lm.range.location).trimmingCharacters(in: .whitespaces).isEmpty
+                    entries.append(MarginEntry(anchor: range.location + lm.range.location + 1, width: 18,
+                        view: AnyView(MarginLinkButton(url: url, color: Color(nsColor: pal.accent))),
+                        cursor: .pointingHand, centerVertically: true, inlineGap: inline))
+                }
+            }
+            marginGutter.build(entries)
         }
 
         private func highlight(range: NSRange) {
@@ -667,87 +907,6 @@ struct EditorView: NSViewRepresentable {
             }
         }
 
-        private func setFont(_ ts: NSTextStorage, _ font: NSFont, _ r: NSRange) { ts.addAttribute(.font, value: font, range: r) }
-        private func dim(_ ts: NSTextStorage, _ pal: Pal, _ r: NSRange) { ts.addAttribute(.foregroundColor, value: pal.inkFaint, range: r) }
-        // A syntax marker: dimmed when its line is being edited, concealed otherwise.
-        private func marker(_ ts: NSTextStorage, _ pal: Pal, _ r: NSRange, _ active: Bool) {
-            guard r.length > 0 else { return }
-            if active { ts.addAttribute(.foregroundColor, value: pal.inkFaint, range: r) }
-            else { concealed.add(in: r) }
-        }
-        private func markerEdges(_ ts: NSTextStorage, _ pal: Pal, _ r: NSRange, _ n: Int, _ off: Int, _ active: Bool) {
-            marker(ts, pal, shift(NSRange(location: r.location, length: n), off), active)
-            marker(ts, pal, shift(NSRange(location: r.location + r.length - n, length: n), off), active)
-        }
-
-        private func styleLine(_ ts: NSTextStorage, _ line: String, _ subRange: NSRange, _ pal: Pal, active: Bool) {
-            let z = parent.zoom
-            let b = parent.baseSize * z
-            let nsLine = line as NSString
-            if let m = regex("^(\\s*)(#{1,6})(\\s+)").firstMatch(in: line, range: full(nsLine)) {
-                let level = m.range(at: 2).length
-                let ratios: [CGFloat] = [1.55, 1.38, 1.22, 1.1, 1.0, 0.92]
-                setFont(ts, Fonts.serif(b * ratios[min(level - 1, 5)], weight: Fonts.titleWeight), subRange)
-                // conceal "### " (marker + following space) when inactive
-                marker(ts, pal, shift(NSRange(location: m.range(at: 2).location, length: m.range(at: 2).length + m.range(at: 3).length), subRange.location), active)
-                inlineStyle(ts, line, subRange, pal, active: active)
-                return
-            }
-            if let m = regex("^(\\s*)(>)(\\s?)").firstMatch(in: line, range: full(nsLine)) {
-                setFont(ts, Fonts.serif(b, weight: Fonts.bodyWeight, italic: true), subRange)
-                ts.addAttribute(.foregroundColor, value: pal.inkSoft, range: subRange)
-                marker(ts, pal, shift(NSRange(location: m.range(at: 2).location, length: m.range(at: 2).length + m.range(at: 3).length), subRange.location), active)
-                inlineStyle(ts, line, subRange, pal, active: active)
-                return
-            }
-            if let m = regex("^(\\s*)([-*+]|\\d+\\.)(\\s+)").firstMatch(in: line, range: full(nsLine)) {
-                marker(ts, pal, shift(m.range(at: 2), subRange.location), active)
-            }
-            inlineStyle(ts, line, subRange, pal, active: active)
-        }
-
-        private func inlineStyle(_ ts: NSTextStorage, _ line: String, _ subRange: NSRange, _ pal: Pal, active: Bool) {
-            let b = parent.baseSize * parent.zoom
-            let nsLine = line as NSString
-            let off = subRange.location
-            for m in regex("`([^`]+)`").matches(in: line, range: full(nsLine)) {
-                setFont(ts, Fonts.monoSized(b * 0.9), shift(m.range, off))
-                ts.addAttribute(.foregroundColor, value: pal.inkSoft, range: shift(m.range, off))
-                markerEdges(ts, pal, m.range, 1, off, active)
-            }
-            for m in regex("\\*\\*([^*\\n]+)\\*\\*").matches(in: line, range: full(nsLine)) {
-                setFont(ts, Fonts.serif(b, weight: Fonts.boldWeight), shift(m.range(at: 1), off))
-                markerEdges(ts, pal, m.range, 2, off, active)
-            }
-            for m in regex("(^|[^*\\w])\\*([^*\\n]+)\\*").matches(in: line, range: full(nsLine)) {
-                setFont(ts, Fonts.serif(b, weight: Fonts.bodyWeight, italic: true), shift(m.range(at: 2), off))
-                marker(ts, pal, shift(NSRange(location: m.range(at: 2).location - 1, length: 1), off), active)
-                marker(ts, pal, shift(NSRange(location: m.range(at: 2).location + m.range(at: 2).length, length: 1), off), active)
-            }
-            for m in regex("(^|[^_\\w])_([^_\\n]+)_").matches(in: line, range: full(nsLine)) {
-                setFont(ts, Fonts.serif(b, weight: Fonts.bodyWeight, italic: true), shift(m.range(at: 2), off))
-                marker(ts, pal, shift(NSRange(location: m.range(at: 2).location - 1, length: 1), off), active)
-                marker(ts, pal, shift(NSRange(location: m.range(at: 2).location + m.range(at: 2).length, length: 1), off), active)
-            }
-            for m in regex("~~([^~\\n]+)~~").matches(in: line, range: full(nsLine)) {
-                ts.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: shift(m.range(at: 1), off))
-                markerEdges(ts, pal, m.range, 2, off, active)
-            }
-            // links [text](url): keep the text, conceal the brackets + url when inactive
-            for m in regex("\\[([^\\]\\n]+)\\]\\(([^)\\n]+)\\)").matches(in: line, range: full(nsLine)) {
-                ts.addAttribute(.foregroundColor, value: pal.accent, range: shift(m.range(at: 1), off))
-                marker(ts, pal, shift(NSRange(location: m.range.location, length: 1), off), active)   // [
-                let tail = NSRange(location: NSMaxRange(m.range(at: 1)), length: NSMaxRange(m.range) - NSMaxRange(m.range(at: 1)))
-                marker(ts, pal, shift(tail, off), active)   // ](url)
-            }
-        }
-
-        private func dimEdges(_ ts: NSTextStorage, _ pal: Pal, _ r: NSRange, _ n: Int, _ off: Int) {
-            dim(ts, pal, shift(NSRange(location: r.location, length: n), off))
-            dim(ts, pal, shift(NSRange(location: r.location + r.length - n, length: n), off))
-        }
-        private func shift(_ r: NSRange, _ off: Int) -> NSRange { NSRange(location: r.location + off, length: r.length) }
-        private func full(_ s: NSString) -> NSRange { NSRange(location: 0, length: s.length) }
 
         // Focus mode: dim every paragraph except the one with the caret.
         func applyFocus() {
